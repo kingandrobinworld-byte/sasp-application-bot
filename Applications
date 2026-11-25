@@ -12,3 +12,273 @@
     "express": "^4.21.2"
   }
 }
+
+const {
+  Client,
+  GatewayIntentBits,
+  EmbedBuilder,
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+  PermissionsBitField
+} = require("discord.js");
+
+const express = require("express");
+
+const app = express();
+app.use(express.json({ limit: "1mb" }));
+
+const client = new Client({
+  intents: [GatewayIntentBits.Guilds]
+});
+
+const PORT = process.env.PORT || 3000;
+
+const STAFF_ROLE_IDS = (process.env.STAFF_ROLE_IDS || "")
+  .split(",")
+  .map(id => id.trim())
+  .filter(Boolean);
+
+function truncate(value, max = 180) {
+  const text = String(value ?? "Not provided");
+  return text.length > max
+    ? text.slice(0, max - 3) + "..."
+    : text;
+}
+
+function authorized(interaction) {
+  const member = interaction.member;
+
+  const hasStaffRole =
+    STAFF_ROLE_IDS.length > 0 &&
+    STAFF_ROLE_IDS.some(id =>
+      member?.roles?.includes?.(id) ||
+      member?.roles?.cache?.has?.(id)
+    );
+
+  const isManager = interaction.memberPermissions?.has(
+    PermissionsBitField.Flags.ManageGuild
+  );
+
+  return hasStaffRole || Boolean(isManager);
+}
+
+// Receive new Google Forms submissions
+app.post("/submit", async (req, res) => {
+  try {
+    if (
+      !process.env.WEBHOOK_SECRET ||
+      req.body.secret !== process.env.WEBHOOK_SECRET
+    ) {
+      return res.status(401).send("Unauthorized");
+    }
+
+    const { applicantDiscordId, responses, applicationType } = req.body;
+
+    if (!/^\d{17,20}$/.test(String(applicantDiscordId || ""))) {
+      return res.status(400).send("Valid Discord ID required");
+    }
+
+    if (!responses || typeof responses !== "object") {
+      return res.status(400).send("Application responses required");
+    }
+
+    const channel = await client.channels.fetch(
+      process.env.APPLICATION_CHANNEL_ID
+    );
+
+    if (!channel?.isTextBased() || !channel.send) {
+      return res.status(500).send("Application channel unavailable");
+    }
+
+    const fields = Object.entries(responses)
+      .slice(0, 20)
+      .map(([question, answer]) => ({
+        name: truncate(question, 200),
+        value: truncate(
+          Array.isArray(answer) ? answer.join(", ") : answer,
+          180
+        ),
+        inline: false
+      }));
+
+    const embed = new EmbedBuilder()
+      .setColor(0xC5A04A)
+      .setTitle("NEW CADET PACKET")
+      .setDescription(
+        "A new application has been submitted and is awaiting review."
+      )
+      .addFields(
+        {
+          name: "APPLICANT DISCORD ID",
+          value: String(applicantDiscordId),
+          inline: false
+        },
+        {
+          name: "APPLICATION TYPE",
+          value: truncate(applicationType || "Cadet Packet", 180),
+          inline: false
+        },
+        ...fields
+      )
+      .setFooter({
+        text: "SAN ANDREAS STATE POLICE • APPLICATION MANAGEMENT"
+      })
+      .setTimestamp();
+
+    const buttons = new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`sasp_accept:${applicantDiscordId}`)
+        .setLabel("ACCEPT")
+        .setStyle(ButtonStyle.Success)
+        .setEmoji("✅"),
+
+      new ButtonBuilder()
+        .setCustomId(`sasp_deny:${applicantDiscordId}`)
+        .setLabel("DENY")
+        .setStyle(ButtonStyle.Danger)
+        .setEmoji("❌")
+    );
+
+    await channel.send({
+      embeds: [embed],
+      components: [buttons],
+      allowedMentions: { parse: [] }
+    });
+
+    res.status(200).send("Application received");
+  } catch (error) {
+    console.error("Submission error:", error);
+    res.status(500).send("Could not process application");
+  }
+});
+
+// Handle Accept and Deny buttons
+client.on("interactionCreate", async interaction => {
+  if (!interaction.isButton()) return;
+
+  const [action, applicantId] = interaction.customId.split(":");
+
+  if (!["sasp_accept", "sasp_deny"].includes(action)) return;
+
+  if (!authorized(interaction)) {
+    return interaction.reply({
+      content: "You are not authorized to review applications.",
+      ephemeral: true
+    });
+  }
+
+  const alreadyDecided = interaction.message.components
+    .flatMap(row => row.components)
+    .some(button => button.disabled);
+
+  if (alreadyDecided) {
+    return interaction.reply({
+      content: "This application has already been reviewed.",
+      ephemeral: true
+    });
+  }
+
+  await interaction.deferReply({ ephemeral: true });
+
+  const accepted = action === "sasp_accept";
+  const staff = interaction.user.tag;
+
+  const acceptanceMessage =
+    `Your Cadet Packet for the San Andreas State Police has been accepted by ${staff}.\n\n` +
+    "Report to the San Andreas State Police Academy at 1000 River Springs Dr, SA 31029 at 11:00am tomorrow.\n\n" +
+    "You have been cleared to proceed with onboarding for the San Andreas State Police. A staff member will contact you shortly with next steps, required documentation, and training information.";
+
+  const denialMessage =
+    `Your Cadet Packet for the San Andreas State Police has been denied by ${staff}.\n\n` +
+    "After review, your submission did not meet the requirements for entry into the San Andreas State Police. You may reapply in the future if you choose to improve and meet the listed standards.";
+
+  let dmSent = true;
+
+  try {
+    const applicant = await client.users.fetch(applicantId);
+    await applicant.send(
+      accepted ? acceptanceMessage : denialMessage
+    );
+  } catch (error) {
+    console.error("Applicant DM failed:", error);
+    dmSent = false;
+  }
+
+  const updatedEmbed = EmbedBuilder.from(
+    interaction.message.embeds[0]
+  )
+    .setColor(accepted ? 0x27864A : 0xB93838)
+    .setTitle(accepted ? "APPLICATION ACCEPTED" : "APPLICATION DENIED")
+    .addFields({
+      name: "REVIEWED BY",
+      value: staff,
+      inline: true
+    })
+    .setFooter({
+      text: `SAN ANDREAS STATE POLICE • ${accepted ? "ACCEPTED" : "DENIED"}`
+    });
+
+  const disabledButtons = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`sasp_accept:${applicantId}`)
+      .setLabel("ACCEPT")
+      .setStyle(ButtonStyle.Success)
+      .setEmoji("✅")
+      .setDisabled(true),
+
+    new ButtonBuilder()
+      .setCustomId(`sasp_deny:${applicantId}`)
+      .setLabel("DENY")
+      .setStyle(ButtonStyle.Danger)
+      .setEmoji("❌")
+      .setDisabled(true)
+  );
+
+  await interaction.message.edit({
+    embeds: [updatedEmbed],
+    components: [disabledButtons]
+  });
+
+  const logMessage =
+    `**APPLICATION ${accepted ? "ACCEPTED" : "DENIED"}**\n` +
+    `Applicant ID: ${applicantId}\n` +
+    `Reviewed by: ${staff}\n` +
+    `Applicant DM: ${dmSent ? "Sent" : "Failed"}`;
+
+  try {
+    if (process.env.LOG_CHANNEL_ID) {
+      const logChannel = await client.channels.fetch(
+        process.env.LOG_CHANNEL_ID
+      );
+      if (logChannel?.isTextBased()) {
+        await logChannel.send({
+          content: logMessage,
+          allowedMentions: { parse: [] }
+        });
+      }
+    }
+  } catch (error) {
+    console.error("Logging error:", error);
+  }
+
+  await interaction.editReply(
+    dmSent
+      ? `Application ${accepted ? "accepted" : "denied"}. Applicant notified successfully.`
+      : `Application ${accepted ? "accepted" : "denied"}, but the applicant's DM could not be delivered.`
+  );
+});
+
+app.get("/", (req, res) => {
+  res.send("SASP Application Bot is running.");
+});
+
+app.listen(PORT, () => {
+  console.log(`Web server listening on ${PORT}`);
+});
+
+client.once("ready", () => {
+  console.log(`${client.user.tag} is online.`);
+});
+
+client.login(process.env.DISCORD_TOKEN);
